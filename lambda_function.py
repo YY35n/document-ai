@@ -2,7 +2,7 @@ import json
 import boto3
 import os
 import openai
-import pinecone
+from pinecone import Pinecone
 import pdfplumber
 import docx
 
@@ -10,15 +10,14 @@ import docx
 S3_BUCKET_NAME = os.environ['S3_BUCKET_NAME']
 OPENAI_API_KEY = os.environ['OPENAI_API_KEY']
 PINECONE_API_KEY = os.environ['PINECONE_API_KEY']
-PINECONE_ENV = os.environ['PINECONE_ENV']
 PINECONE_INDEX_NAME = os.environ['PINECONE_INDEX_NAME']
 
 # Initialize AWS S3
 s3_client = boto3.client('s3')
 
 # Initialize Pinecone
-pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENV)
-index = pinecone.Index(PINECONE_INDEX_NAME)
+pc = Pinecone(api_key=PINECONE_API_KEY)
+index = pc.Index(PINECONE_INDEX_NAME)
 
 # Set OpenAI API key
 openai.api_key = OPENAI_API_KEY
@@ -45,16 +44,26 @@ def extract_text_from_file(file_path, file_extension):
         return extract_text_from_pdf(file_path)
     elif file_extension == ".docx":
         return extract_text_from_doc(file_path)
-    else:
-        return None
+    return None
+
+def chunk_text(text, max_tokens=8191):
+    """Chunk text to fit OpenAI's embedding limit"""
+    words = text.split()
+    chunks = []
+    while words:
+        chunk = words[:max_tokens]
+        chunks.append(" ".join(chunk))
+        words = words[max_tokens:]
+    return chunks
 
 def get_embedding(text):
     """Generate embeddings using OpenAI"""
-    response = openai.Embedding.create(
-        input=text,
-        model="text-embedding-ada-002"
-    )
-    return response['data'][0]['embedding']
+    chunks = chunk_text(text)
+    embeddings = [
+        openai.embeddings.create(input=chunk, model="text-embedding-ada-002").data[0].embedding
+        for chunk in chunks
+    ]
+    return embeddings
 
 def lambda_handler(event, context):
     """Triggered when a file is uploaded to S3"""
@@ -71,15 +80,15 @@ def lambda_handler(event, context):
         text_content = extract_text_from_file(file_path, file_extension)
 
         if text_content:
-            # Convert text to embedding
-            embedding = get_embedding(text_content)
-
+            embeddings = get_embedding(text_content)
+            
             # Store in Pinecone
-            index.upsert([(file_key, embedding)])
+            upsert_data = [(f"{file_key}-{i}", embedding) for i, embedding in enumerate(embeddings)]
+            index.upsert(upsert_data)
 
             return {
                 'statusCode': 200,
-                'body': json.dumps(f"Stored embedding for {file_key} in Pinecone.")
+                'body': json.dumps(f"Stored embeddings for {file_key} in Pinecone.")
             }
 
     return {
@@ -87,16 +96,22 @@ def lambda_handler(event, context):
         'body': json.dumps("Failed to process file.")
     }
 
-def search_pinecone(query):
+def search_pinecone(query, top_k=5):
     """Search Pinecone for related embeddings"""
-    query_embedding = get_embedding(query)
-    result = index.query(vector=query_embedding, top_k=5, include_metadata=True)
-    return [match['id'] for match in result['matches']]
+    query_embedding = get_embedding(query)[0]
+    result = index.query(vector=query_embedding, top_k=top_k, include_metadata=True)
+
+    if 'matches' in result and result['matches']:
+        return [match['id'] for match in result['matches']]
+    return []
 
 def generate_gpt_response(user_query):
     """Generate GPT response based on document context"""
     related_docs = search_pinecone(user_query)
     
+    if not related_docs:
+        return "No relevant documents found in the knowledge base."
+
     context = "\n".join(related_docs)
     prompt = f"Use the following documents to answer: {context}\n\nUser query: {user_query}"
     
